@@ -1,87 +1,255 @@
-// 1. Include the SimpleFOC library
 #include <SimpleFOC.h>
 #include <Arduino.h>
+#include <math.h>
+#include <SoftwareSerial.h>
+
 // --- Configuration ---
-const int NUM_DENTS = 120; // How many "clicks" or detents per revolution
+const int NUM_DENTS = 12;
+
+// --- Anti-vibration Tuning ---
+const float LPF_TIMESCALE = 0.015; // [s] Time constant for sensor LPF. Start with 0.01
+const float RAMP_TIMESCALE = 0.; // [s] Time constant for PID output ramp. Start with 0.05
+const float DEAD_ZONE_RAD = radians(1); // [rad] Dead zone. Start with 0.2 degrees
 
 // 2. Sensor Instance
-// Using the generic I2C sensor class for the MT6701
-// Constructor: MagneticSensorI2C(I2C_address, bits_per_revolution, angle_register_msb)
 MagneticSensorI2C sensor = MagneticSensorI2C(MT6701_I2C);
 
 // 3. Motor and Driver Instances
-// BLDCMotor(pole_pairs)
 BLDCMotor motor = BLDCMotor(7);
-// BLDCDriver3PWM(pwmA, pwmB, pwmC, enable_pin)
 BLDCDriver3PWM driver = BLDCDriver3PWM(11, 10, 9, 8);
 
+SoftwareSerial linkSerial(2, 3);
+volatile float remote_target_angle = 0.0;
+
+// A union is the standard, safe way to convert a float to bytes
+union FloatConverter {
+    float f;
+    byte b[4]; // A 32-bit float is 4 bytes
+};
+
+const byte SOP1 = 0xDE;
+const byte SOP2 = 0xAD;
+
+enum RxState {
+    WAIT_SOP1,
+    WAIT_SOP2,
+    READ_PAYLOAD,
+    READ_CHECKSUM
+};
+
+RxState rx_state = WAIT_SOP1;
+int payload_bytes_received = 0;
+
+FloatConverter angle_to_send;
+FloatConverter angle_to_receive;
+
+const unsigned long SEND_INTERVAL_MICROS = 4000; // 4ms = 250Hz
+unsigned long last_send_time_micros = 0;
+
+byte calculateChecksum(byte* data, int len) {
+    byte checksum = 0;
+    for (int i = 0; i < len; i++) {
+        checksum += data[i];
+    }
+    return checksum;
+}
+
+void checkSerialLink() {
+    while (linkSerial.available() > 0) {
+        byte b = linkSerial.read();
+
+        switch (rx_state) {
+        case WAIT_SOP1:
+            if (b == SOP1) {
+                rx_state = WAIT_SOP2;
+            }
+            break;
+
+        case WAIT_SOP2:
+            if (b == SOP2) {
+                rx_state = READ_PAYLOAD;
+                payload_bytes_received = 0;
+            }
+            else {
+                rx_state = WAIT_SOP1;
+            }
+            break;
+
+        case READ_PAYLOAD:
+            angle_to_receive.b[payload_bytes_received] = b;
+            payload_bytes_received++;
+
+            if (payload_bytes_received >= 4) {
+                // We have the full 4-byte float, now wait for the checksum
+                rx_state = READ_CHECKSUM;
+            }
+            break;
+
+        // FIX #3: ADDED A CHECKSUM STATE
+        case READ_CHECKSUM:
+            byte received_checksum = b;
+            byte calculated_checksum = calculateChecksum(angle_to_receive.b, 4);
+
+            if (received_checksum == calculated_checksum) {
+                // Checksum good! Check for NaN.
+                if (!isnan(angle_to_receive.f)) {
+                    remote_target_angle = angle_to_receive.f;
+                }
+                else {
+                    // Serial.println("Warn: NaN received, packet ignored.");
+                }
+            }
+            else {
+                // Checksum failed, data is corrupt!
+                // Serial.println("Warn: Checksum mismatch, packet ignored.");
+            }
+
+            // Reset for next packet
+            rx_state = WAIT_SOP1;
+            break;
+        }
+    }
+}
+
+/**
+* Normalizes an angle to the shortest path, from -PI to +PI.
+* This is the correct function for PID error calculation.
+*/
+float normalizeErrorAngle(float angle) {
+    float a = fmod(angle + _PI, _2PI);
+    if (a < 0) a += _2PI; // Ensure positive
+    return a - _PI; // Shift back to [-PI, PI]
+}
+
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("Haptic Knob with Detents Initialized (Torque Mode)");
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("Haptic Knob with Detents Initialized (Torque Mode)");
+    linkSerial.begin(115200);
 
-  // Initialize the sensor
-  sensor.init();
+    // Initialize the sensor
+    sensor.init();
 
-  // Initialize and link the driver
-  driver.voltage_power_supply = 15;
-  driver.init();
-  motor.linkDriver(&driver);
+    // Initialize and link the driver
+    driver.voltage_power_supply = 15;
+    driver.init();
+    motor.linkDriver(&driver);
 
-  // Link the sensor to the motor
-  motor.linkSensor(&sensor);
+    // Link the sensor to the motor
+    motor.linkSensor(&sensor);
 
-  // Configure motor control parameters
-  motor.controller = MotionControlType::torque; // We will control the motor's torque directly
-  motor.voltage_limit = 4;   // Volts - Tweak this for more/less strength
-  motor.velocity_limit = 50; // Rad/s
+    // Configure motor control parameters
+    motor.controller = MotionControlType::torque;
+    motor.voltage_limit = 4;
+    motor.velocity_limit = 50;
 
-  motor.PID_velocity.P = 10;
-  motor.PID_velocity.I = 0;
-  motor.PID_velocity.D = 0.05;
+    // --- IMPROVEMENT 1: LOW-PASS FILTER (LPF) ---
+    // Smooths the noisy sensor readings.
+    motor.LPF_angle.Tf = LPF_TIMESCALE;
 
-  // Initialize the motor
-  motor.init();
-  motor.initFOC();
+    // Configure PID
+    motor.PID_velocity.P = .5; // Your P-value
+    motor.PID_velocity.I = 0;
+    motor.PID_velocity.D = 0; // Your D-value
 
-  Serial.println("Motor and Sensor ready. Turn the knob to feel the detents.");
+    // --- IMPROVEMENT 3: PID OUTPUT RAMP ---
+    // Smooths the PID output torque, reducing jitter.
+    motor.PID_velocity.output_ramp = RAMP_TIMESCALE;
+
+    // Initialize the motor
+    motor.init();
+
+    // Force sensor direction (if needed from our previous debugging)
+    // motor.sensor_direction = Direction::CCW;
+
+    // Align motor and sensor
+    Serial.print("Aligning motor and sensor... ");
+    if (!motor.initFOC()) {
+        Serial.println("FAILED!");
+        while (1) delay(100);
+    }
+    Serial.println("Success.");
 }
 
 void loop() {
-  // This function is crucial. It reads the sensor and calculates the motor's electrical angle.
-  motor.loopFOC();
+    // This function is crucial. It reads the sensor (and applies the LPF)
+    motor.loopFOC();
 
-  // --- Haptic Detent Logic (Torque Mode) ---
+    // --- Haptic Detent Logic ---
+    const float DENT_ANGLE = _2PI / NUM_DENTS;
 
-  // Calculate the angle of each detent
-  const float DENT_ANGLE = _2PI / NUM_DENTS;
+    // We use the filtered angle from the motor, not the raw sensor
+    float current_angle = motor.shaft_angle;
+    float target_angle = round(current_angle / DENT_ANGLE) * DENT_ANGLE;
 
-  // Get the current, real angle from the sensor
-  float current_angle = sensor.getAngle();
+    // --- Send Data ---
+    unsigned long now_micros_comm = micros();
+    if (now_micros_comm - last_send_time_micros > SEND_INTERVAL_MICROS) {
+        last_send_time_micros = now_micros_comm;
 
-  // Find the closest detent angle
-  float target_angle = round(current_angle / DENT_ANGLE) * DENT_ANGLE;
+        angle_to_send.f = current_angle;
 
-  // Calculate the angular error from the nearest detent.
-  // _normalizeAngle is CRITICAL to prevent large torque spikes at the 0-2PI crossover.
-  float error = current_angle - target_angle;
+        // FIX #3: Send 7 bytes: [SOP1][SOP2][B0][B1][B2][B3][CHECKSUM]
+        byte checksum = calculateChecksum(angle_to_send.b, 4);
 
-  // Calculate the torque to apply. This acts like a spring-damper system.
-  // The first term is a proportional force that pulls the knob towards the detent (the "spring").
-  // The second term is a damping force that resists motion, preventing oscillation.
-  float torque = motor.PID_velocity(-error);
+        linkSerial.write(SOP1);
+        linkSerial.write(SOP2);
+        linkSerial.write(angle_to_send.b, 4);
+        linkSerial.write(checksum); // Send the checksum
+    }
 
-  // Set the torque on the motor. In torque mode, motor.move() takes a voltage value.
-  motor.move(torque);
+    checkSerialLink();
+    if (isnan(current_angle) || isinf(current_angle)) {
+        Serial.println("!!! CRITICAL: Bad sensor read (NaN/Inf). Halting motor!");
+        motor.move(0); // Command zero torque
+        motor.PID_velocity.reset(); // Reset PID
+        return; // Skip the rest of this loop to prevent crash
+    }
 
-  // Optional: Print values for debugging. It's best to keep this commented out for performance.
-  /*
-  Serial.print(current_angle);
-  Serial.print("\t");
-  Serial.print(target_angle);
-  Serial.print("\t");
-  Serial.print(error);
-  Serial.print("\t");
-  Serial.println(torque);
-  */
+    // Calculate the error using your correct normalization function
+    float error;
+
+    // Get the absolute (always positive) velocity
+    float current_velocity = fabsf(motor.shaft_velocity);
+
+    if (current_velocity > 5) {
+        // Spinning fast: make detents disappear
+        error = 0;
+    }
+    else {
+        // Spinning slow: calculate restoring force as normal
+        error = normalizeErrorAngle(current_angle - remote_target_angle);
+    }
+
+    // --- CORRECTED DEAD ZONE & RAMP LOGIC ---
+
+    if (fabsf(error) < DEAD_ZONE_RAD) {
+        // 1. We are IN the dead zone. Force torque to zero.
+        motor.move(0);
+
+        // 2. CRITICAL FIX: Reset the PID controller.
+        // This clears the integral (I) and resets the
+        // output ramp's internal state to 0.
+        motor.PID_velocity.reset();
+    }
+    else {
+        // 1. We are OUTSIDE the dead zone.
+        // 2. Calculate torque. The PID ramp will now correctly
+        // smooth the transition from 0.
+        float torque = motor.PID_velocity(-error);
+
+        // 3. Set the torque on the motor
+        motor.move(torque);
+    }
+
+    // Optional: Print values for debugging.
+    // Serial.print(current_angle);
+    // Serial.print("\t");
+    // Serial.print(target_angle);
+    // Serial.print("\t");
+    // Serial.print(remote_target_angle);
+    // Serial.print("\t");
+    // Serial.print(error);
+    // Serial.print("\t");
+    // Serial.println(motor.voltage.q); // Print the actual applied voltage
 }
